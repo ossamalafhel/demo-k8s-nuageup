@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: bankcore-pdb
+  namespace: banking-prod
+  labels:
+    app: bankcore
+spec:
+  minAvailable: 2  # Always keep at least 2 pods running
+  selector:
+    matchLabels:
+      app: bankcore
+      component: backend

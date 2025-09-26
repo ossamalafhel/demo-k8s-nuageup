@@ -1,0 +1,255 @@
+stages:
+  - build
+  - test
+  - security
+  - package
+  - deploy-staging
+  - deploy-production
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  DOCKER_REGISTRY: ${CI_REGISTRY}
+  IMAGE_NAME: ${CI_REGISTRY_IMAGE}/bankcore
+  IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}
+  DOCKER_TLS_CERTDIR: "/certs"
+
+cache:
+  paths:
+    - .m2/repository/
+    - app/target/
+
+before_script:
+  - echo "Pipeline starting for branch ${CI_COMMIT_BRANCH}"
+  - echo "Commit SHA ${CI_COMMIT_SHA}"
+
+# Build stage
+build:app:
+  stage: build
+  image: maven:3.9-eclipse-temurin-17
+  script:
+    - cd app
+    - mvn clean compile
+    - mvn package -DskipTests
+  artifacts:
+    paths:
+      - app/target/*.jar
+    expire_in: 1 hour
+  only:
+    - branches
+    - merge_requests
+    - tags
+
+# Test stage
+test:unit:
+  stage: test
+  image: maven:3.9-eclipse-temurin-17
+  needs: ["build:app"]
+  script:
+    - cd app
+    - mvn test
+    - mvn jacoco:report
+  coverage: '/Total.*?([0-9]{1,3})%/'
+  artifacts:
+    reports:
+      junit:
+        - app/target/surefire-reports/TEST-*.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: app/target/site/jacoco/jacoco.xml
+    paths:
+      - app/target/site/jacoco/
+    expire_in: 1 week
+
+test:integration:
+  stage: test
+  image: maven:3.9-eclipse-temurin-17
+  needs: ["build:app"]
+  services:
+    - postgres:15-alpine
+  variables:
+    POSTGRES_DB: testdb
+    POSTGRES_USER: test
+    POSTGRES_PASSWORD: test
+    DB_URL: "jdbc:postgresql://postgres:5432/testdb"
+    DB_USER: test
+    DB_PASSWORD: test
+    SPRING_PROFILES_ACTIVE: test
+  script:
+    - cd app
+    - mvn verify -DskipUnitTests
+  artifacts:
+    reports:
+      junit:
+        - app/target/failsafe-reports/TEST-*.xml
+    expire_in: 1 week
+
+# Security scanning
+security:sast:
+  stage: security
+  needs: ["build:app"]
+  image:
+    name: findsecbugs/findsecbugs:latest
+    entrypoint: [""]
+  script:
+    - /opt/findsecbugs/findsecbugs.sh -progress -html -output sast-report.html app/target/*.jar
+  artifacts:
+    reports:
+      sast: sast-report.html
+    expire_in: 1 week
+  allow_failure: true
+
+security:dependency-check:
+  stage: security
+  needs: ["build:app"]
+  image: owasp/dependency-check:latest
+  script:
+    - cd app
+    - /usr/share/dependency-check/bin/dependency-check.sh --project "demo" --scan . --format ALL
+  artifacts:
+    paths:
+      - app/dependency-check-report.*
+    expire_in: 1 week
+  allow_failure: true
+
+security:container-scan:
+  stage: security
+  needs: ["package:docker"]
+  image: aquasec/trivy:latest
+  script:
+    - trivy image --severity HIGH,CRITICAL --exit-code 1 ${IMAGE_NAME}:${IMAGE_TAG}
+  allow_failure: true
+
+# Package stage
+package:docker:
+  stage: package
+  needs: ["test:unit", "test:integration"]
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+  script:
+    - cd app
+    - docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+    - docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+    - docker push ${IMAGE_NAME}:${IMAGE_TAG}
+    - docker push ${IMAGE_NAME}:latest
+    - |
+      if [ "$CI_COMMIT_BRANCH" == "main" ]; then
+        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:stable
+        docker push ${IMAGE_NAME}:stable
+      fi
+  only:
+    - branches
+    - tags
+
+# Deploy to Kubernetes Staging
+deploy:k8s-staging:
+  stage: deploy-staging
+  needs: ["package:docker", "security:container-scan"]
+  image: bitnami/kubectl:latest
+  environment:
+    name: staging
+    url: https://staging.bankcore.com
+  before_script:
+    - kubectl config set-cluster k8s --server="${K8S_STAGING_URL}"
+    - kubectl config set-credentials gitlab --token="${K8S_STAGING_TOKEN}"
+    - kubectl config set-context default --cluster=k8s --user=gitlab --namespace=banking-staging
+    - kubectl config use-context default
+  script:
+    - sed -i "s|image:.*|image: ${IMAGE_NAME}:${IMAGE_TAG}|g" kubernetes/deployment.yaml
+    - kubectl apply -f kubernetes/namespace.yaml || true
+    - kubectl apply -f kubernetes/
+    - kubectl rollout status deployment/bankcore -n banking-staging --timeout=5m
+    - kubectl get pods -n banking-staging
+  when: manual
+  only:
+    - develop
+    - main
+
+# Deploy to VM Staging
+deploy:vm-staging:
+  stage: deploy-staging
+  needs: ["package:docker"]
+  image: alpine:latest
+  environment:
+    name: vm-staging
+    url: https://vm-staging.bankcore.com
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "${SSH_STAGING_KEY}" | base64 -d | ssh-add -
+    - mkdir -p ~/.ssh
+    - ssh-keyscan -H ${VM_STAGING_HOST} >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh ${VM_STAGING_USER}@${VM_STAGING_HOST} << EOF
+        cd /opt/bankcore
+        export VERSION=${IMAGE_TAG}
+        ./scripts/deploy.sh
+      EOF
+  when: manual
+  only:
+    - develop
+    - main
+
+# Deploy to Production (K8s)
+deploy:k8s-production:
+  stage: deploy-production
+  needs: ["deploy:k8s-staging"]
+  image: bitnami/kubectl:latest
+  environment:
+    name: production
+    url: https://bankcore.com
+  before_script:
+    - kubectl config set-cluster k8s --server="${K8S_PROD_URL}"
+    - kubectl config set-credentials gitlab --token="${K8S_PROD_TOKEN}"
+    - kubectl config set-context default --cluster=k8s --user=gitlab --namespace=banking-prod
+    - kubectl config use-context default
+  script:
+    - sed -i "s|image:.*|image: ${IMAGE_NAME}:${IMAGE_TAG}|g" kubernetes/deployment.yaml
+    - kubectl apply -f kubernetes/
+    - kubectl rollout status deployment/bankcore -n banking-prod --timeout=10m
+    - kubectl get pods -n banking-prod
+    - |
+      # Run smoke tests
+      INGRESS_IP=$(kubectl get ingress bankcore-ingress -n banking-prod -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+      curl -f http://${INGRESS_IP}/api/v1/health || exit 1
+  when: manual
+  only:
+    - main
+    - tags
+
+# Rollback job
+rollback:production:
+  stage: deploy-production
+  image: bitnami/kubectl:latest
+  environment:
+    name: production
+  before_script:
+    - kubectl config set-cluster k8s --server="${K8S_PROD_URL}"
+    - kubectl config set-credentials gitlab --token="${K8S_PROD_TOKEN}"
+    - kubectl config set-context default --cluster=k8s --user=gitlab --namespace=banking-prod
+    - kubectl config use-context default
+  script:
+    - kubectl rollout undo deployment/bankcore -n banking-prod
+    - kubectl rollout status deployment/bankcore -n banking-prod
+  when: manual
+  only:
+    - main
+
+# Performance test
+test:performance:
+  stage: test
+  needs: ["deploy:k8s-staging"]
+  image: grafana/k6:latest
+  script:
+    - k6 run tests/load/k6-load-test.js --out json=k6-results.json
+  artifacts:
+    reports:
+      performance: k6-results.json
+    expire_in: 1 week
+  when: manual
+  only:
+    - develop
+    - main

@@ -1,0 +1,368 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: maven
+    image: maven:3.9-eclipse-temurin-21
+    command:
+    - sleep
+    args:
+    - infinity
+    volumeMounts:
+    - mountPath: /root/.m2
+      name: m2-cache
+  - name: docker
+    image: docker:24-dind
+    command:
+    - dockerd
+    args:
+    - --host=unix:///var/run/docker.sock
+    - --host=tcp://0.0.0.0:2375
+    - --storage-driver=overlay2
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - mountPath: /var/run
+      name: docker-sock
+  - name: kubectl
+    image: bitnami/kubectl:latest
+    command:
+    - sleep
+    args:
+    - infinity
+  - name: trivy
+    image: aquasec/trivy:latest
+    command:
+    - sleep
+    args:
+    - infinity
+  volumes:
+  - name: m2-cache
+    persistentVolumeClaim:
+      claimName: maven-cache
+  - name: docker-sock
+    emptyDir: {}
+'''
+        }
+    }
+
+    options {
+        timestamps()
+        timeout(time: 1, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '5'))
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        DOCKER_REGISTRY = credentials('docker-registry')
+        IMAGE_NAME = "${DOCKER_REGISTRY}/banking-demo"
+        IMAGE_TAG = "${BUILD_NUMBER}-${GIT_COMMIT.substring(0,7)}"
+        SONAR_TOKEN = credentials('sonar-token')
+        K8S_STAGING = credentials('k8s-staging-config')
+        K8S_PROD = credentials('k8s-prod-config')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_BRANCH = sh(returnStdout: true, script: 'git rev-parse --abbrev-ref HEAD').trim()
+                    env.GIT_COMMIT_MSG = sh(returnStdout: true, script: 'git log -1 --pretty=%B').trim()
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                container('maven') {
+                    dir('app') {
+                        sh '''
+                            mvn clean compile
+                            mvn package -DskipTests
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        container('maven') {
+                            dir('app') {
+                                sh 'mvn test'
+                                junit 'target/surefire-reports/*.xml'
+                                jacoco(
+                                    execPattern: 'target/jacoco.exec',
+                                    classPattern: 'target/classes',
+                                    sourcePattern: 'src/main/java'
+                                )
+                            }
+                        }
+                    }
+                }
+
+                stage('Integration Tests') {
+                    steps {
+                        container('maven') {
+                            dir('app') {
+                                sh '''
+                                    docker run -d \
+                                        --name postgres-test \
+                                        -e POSTGRES_DB=testdb \
+                                        -e POSTGRES_USER=test \
+                                        -e POSTGRES_PASSWORD=test \
+                                        -p 5432:5432 \
+                                        postgres:15-alpine
+
+                                    export DB_URL=jdbc:postgresql://localhost:5432/testdb
+                                    export DB_USER=test
+                                    export DB_PASSWORD=test
+                                    
+                                    mvn verify -DskipUnitTests
+                                    
+                                    docker stop postgres-test
+                                    docker rm postgres-test
+                                '''
+                            }
+                        }
+                    }
+                }
+
+                stage('SonarQube Analysis') {
+                    steps {
+                        container('maven') {
+                            dir('app') {
+                                sh '''
+                                    mvn sonar:sonar \
+                                        -Dsonar.projectKey=banking-demo \
+                                        -Dsonar.host.url=${SONAR_HOST} \
+                                        -Dsonar.login=${SONAR_TOKEN}
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            parallel {
+                stage('OWASP Dependency Check') {
+                    steps {
+                        container('maven') {
+                            dir('app') {
+                                sh 'mvn org.owasp:dependency-check-maven:check'
+                                publishHTML(target: [
+                                    allowMissing: false,
+                                    alwaysLinkToLastBuild: true,
+                                    keepAll: true,
+                                    reportDir: 'target',
+                                    reportFiles: 'dependency-check-report.html',
+                                    reportName: 'OWASP Dependency Check Report'
+                                ])
+                            }
+                        }
+                    }
+                }
+
+                stage('SpotBugs') {
+                    steps {
+                        container('maven') {
+                            dir('app') {
+                                sh 'mvn com.github.spotbugs:spotbugs-maven-plugin:spotbugs'
+                                recordIssues(
+                                    enabledForFailure: true,
+                                    tool: spotBugs(pattern: 'target/spotbugsXml.xml')
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                container('docker') {
+                    dir('app') {
+                        sh '''
+                            docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+                            docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Scan Docker Image') {
+            steps {
+                container('trivy') {
+                    sh '''
+                        trivy image --severity HIGH,CRITICAL \
+                            --format json \
+                            --output trivy-report.json \
+                            ${IMAGE_NAME}:${IMAGE_TAG}
+                    '''
+                    recordIssues(
+                        enabledForFailure: false,
+                        tool: trivy(pattern: 'trivy-report.json')
+                    )
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                    tag pattern: "v\\d+\\.\\d+\\.\\d+", comparator: "REGEXP"
+                }
+            }
+            steps {
+                container('docker') {
+                    sh '''
+                        echo ${DOCKER_REGISTRY_PSW} | docker login -u ${DOCKER_REGISTRY_USR} --password-stdin
+                        docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                        docker push ${IMAGE_NAME}:latest
+                        
+                        if [ "${GIT_BRANCH}" = "main" ]; then
+                            docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:stable
+                            docker push ${IMAGE_NAME}:stable
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'main'
+                }
+            }
+            steps {
+                container('kubectl') {
+                    sh '''
+                        echo "${K8S_STAGING}" > /tmp/kubeconfig
+                        export KUBECONFIG=/tmp/kubeconfig
+                        
+                        sed -i "s|image:.*|image: ${IMAGE_NAME}:${IMAGE_TAG}|g" kubernetes/deployment.yaml
+                        
+                        kubectl apply -f kubernetes/namespace.yaml || true
+                        kubectl apply -f kubernetes/ -n banking-staging
+                        kubectl rollout status deployment/banking-demo -n banking-staging --timeout=5m
+                    '''
+                }
+                
+                script {
+                    env.STAGING_URL = sh(
+                        returnStdout: true, 
+                        script: 'kubectl get ingress banking-demo-ingress -n banking-staging -o jsonpath="{.status.loadBalancer.ingress[0].hostname}"'
+                    ).trim()
+                }
+            }
+        }
+
+        stage('Smoke Tests') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'main'
+                }
+            }
+            steps {
+                sh '''
+                    sleep 30
+                    curl -f http://${STAGING_URL}/api/v1/health || exit 1
+                    curl -f http://${STAGING_URL}/actuator/health || exit 1
+                '''
+            }
+        }
+
+        stage('Performance Test') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    docker run --rm \
+                        -v ${WORKSPACE}/tests/load:/scripts \
+                        grafana/k6:latest \
+                        run /scripts/k6-load-test.js \
+                        --env BASE_URL=http://${STAGING_URL}
+                '''
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            input {
+                message "Deploy to production?"
+                ok "Deploy"
+                parameters {
+                    string(name: 'APPROVER', defaultValue: '', description: 'Your name')
+                    choice(name: 'DEPLOYMENT_TYPE', choices: ['Rolling Update', 'Blue-Green'], description: 'Deployment strategy')
+                }
+            }
+            steps {
+                container('kubectl') {
+                    script {
+                        if (params.DEPLOYMENT_TYPE == 'Blue-Green') {
+                            sh '''
+                                echo "Performing Blue-Green deployment..."
+                                # Blue-Green deployment logic here
+                            '''
+                        } else {
+                            sh '''
+                                echo "${K8S_PROD}" > /tmp/kubeconfig
+                                export KUBECONFIG=/tmp/kubeconfig
+                                
+                                kubectl apply -f kubernetes/ -n banking-prod
+                                kubectl set image deployment/banking-demo banking-demo=${IMAGE_NAME}:${IMAGE_TAG} -n banking-prod
+                                kubectl rollout status deployment/banking-demo -n banking-prod --timeout=10m
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            echo 'Pipeline completed successfully!'
+            slackSend(
+                color: 'good',
+                message: "✅ Build #${BUILD_NUMBER} succeeded for ${GIT_BRANCH}\nCommit: ${GIT_COMMIT_MSG}"
+            )
+        }
+        failure {
+            echo 'Pipeline failed!'
+            slackSend(
+                color: 'danger',
+                message: "❌ Build #${BUILD_NUMBER} failed for ${GIT_BRANCH}\nCommit: ${GIT_COMMIT_MSG}"
+            )
+        }
+        unstable {
+            echo 'Pipeline unstable!'
+            slackSend(
+                color: 'warning',
+                message: "⚠️ Build #${BUILD_NUMBER} is unstable for ${GIT_BRANCH}"
+            )
+        }
+    }
+}

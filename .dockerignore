@@ -1,0 +1,46 @@
+# Maven
+target/
+*.class
+*.jar
+*.war
+*.ear
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Documentation
+docs/
+*.md
+
+# Scripts
+scripts/
+*.sh
+
+# CI/CD
+.gitlab-ci.yml
+Jenkinsfile
+
+# Git
+.git/
+.gitignore
+
+# Test reports
+DEMO_REPORT_*.html
+TEST_REPORT_*.html
+
+# Temporary files
+*.tmp
+*.bak
+*~

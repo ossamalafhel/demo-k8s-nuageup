@@ -1,0 +1,116 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bankcore-netpol
+  namespace: banking-prod
+  labels:
+    app: bankcore
+spec:
+  podSelector:
+    matchLabels:
+      app: bankcore
+      component: backend
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  # Allow traffic from Ingress controller
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+  
+  # Allow traffic from other bankcore pods (for clustering)
+  - from:
+    - podSelector:
+        matchLabels:
+          app: bankcore
+    ports:
+    - protocol: TCP
+      port: 8080
+  
+  # Allow metrics scraping from Prometheus
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 8080
+  
+  # Allow traffic from legacy VMs (hybrid connectivity)
+  - from:
+    - ipBlock:
+        cidr: 10.0.1.0/24  # VM subnet
+        except:
+        - 10.0.1.5/32      # Exclude specific IPs if needed
+    ports:
+    - protocol: TCP
+      port: 8080
+  
+  egress:
+  # Allow DNS resolution
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+  
+  # Allow connection to PostgreSQL
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgresql
+    - namespaceSelector:
+        matchLabels:
+          name: banking-prod
+    ports:
+    - protocol: TCP
+      port: 5432
+  
+  # Allow connection to Redis (if used)
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - protocol: TCP
+      port: 6379
+  
+  # Allow connection to external APIs
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 169.254.169.254/32  # Block AWS metadata service
+        - 10.0.0.0/8
+        - 192.168.0.0/16
+        - 172.16.0.0/12
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80
+  
+  # Allow connection to legacy VM services
+  - to:
+    - ipBlock:
+        cidr: 10.0.1.0/24  # VM subnet
+    ports:
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 5432

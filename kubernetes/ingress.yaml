@@ -1,0 +1,71 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bankcore-ingress
+  namespace: banking-prod
+  labels:
+    app: bankcore
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "DNT,X-CustomHeader,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Authorization"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - bankcore.yourdomain.com
+    secretName: bankcore-tls
+  rules:
+  - host: bankcore.yourdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: bankcore-service
+            port:
+              name: http
+---
+# Ingress for management endpoints (restricted)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bankcore-mgmt-ingress
+  namespace: banking-prod
+  labels:
+    app: bankcore
+  annotations:
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,172.16.0.0/12"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "demo Management"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - bankcore-mgmt.yourdomain.com
+    secretName: bankcore-mgmt-tls
+  rules:
+  - host: bankcore-mgmt.yourdomain.com
+    http:
+      paths:
+      - path: /actuator
+        pathType: Prefix
+        backend:
+          service:
+            name: bankcore-service
+            port:
+              name: management

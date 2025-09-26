@@ -1,0 +1,350 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Workflow
+metadata:
+  name: bankcore-chaos
+  namespace: banking-prod
+spec:
+  entry: entry
+  templates:
+  - name: entry
+    templateType: Parallel
+    deadline: 30m
+    children:
+    - pod-failure-test
+    - network-delay-test
+    - cpu-stress-test
+    - dns-chaos-test
+
+  # Test 1: Random Pod Failure
+  - name: pod-failure-test
+    templateType: Serial
+    deadline: 10m
+    children:
+    - inject-pod-failure
+    - verify-recovery
+    - wait-stabilize
+
+  - name: inject-pod-failure
+    templateType: PodChaos
+    deadline: 5m
+    podChaos:
+      selector:
+        namespaces:
+        - banking-prod
+        labelSelectors:
+          app: bankcore
+      mode: one
+      action: pod-failure
+      duration: "60s"
+
+  - name: verify-recovery
+    templateType: Task
+    deadline: 2m
+    task:
+      container:
+        name: verify
+        image: curlimages/curl:latest
+        command:
+        - sh
+        - -c
+        - |
+          for i in $(seq 1 20); do
+            if curl -f http://bankcore-service.banking-prod/api/v1/health; then
+              echo "Service is healthy"
+              exit 0
+            fi
+            sleep 3
+          done
+          exit 1
+
+  - name: wait-stabilize
+    templateType: Suspend
+    deadline: 2m
+    suspend:
+      duration: "60s"
+
+  # Test 2: Network Delay
+  - name: network-delay-test
+    templateType: Serial
+    deadline: 10m
+    children:
+    - inject-network-delay
+    - measure-latency
+    - remove-network-delay
+
+  - name: inject-network-delay
+    templateType: NetworkChaos
+    deadline: 5m
+    networkChaos:
+      selector:
+        namespaces:
+        - banking-prod
+        labelSelectors:
+          app: bankcore
+      mode: all
+      action: delay
+      delay:
+        latency: "200ms"
+        correlation: "25"
+        jitter: "50ms"
+      duration: "3m"
+      direction: both
+
+  - name: measure-latency
+    templateType: Task
+    deadline: 2m
+    task:
+      container:
+        name: latency-test
+        image: curlimages/curl:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Testing response times with network delay..."
+          for i in $(seq 1 5); do
+            time curl -s http://bankcore-service.banking-prod/api/v1/health
+            sleep 2
+          done
+
+  - name: remove-network-delay
+    templateType: Suspend
+    suspend:
+      duration: "10s"
+
+  # Test 3: CPU Stress
+  - name: cpu-stress-test
+    templateType: Serial
+    deadline: 10m
+    children:
+    - inject-cpu-stress
+    - monitor-performance
+    - stop-cpu-stress
+
+  - name: inject-cpu-stress
+    templateType: StressChaos
+    deadline: 5m
+    stressChaos:
+      selector:
+        namespaces:
+        - banking-prod
+        labelSelectors:
+          app: bankcore
+      mode: one
+      stressors:
+        cpu:
+          workers: 2
+          load: 80
+      duration: "2m"
+
+  - name: monitor-performance
+    templateType: Task
+    deadline: 3m
+    task:
+      container:
+        name: perf-monitor
+        image: curlimages/curl:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Monitoring performance under CPU stress..."
+          START=$(date +%s)
+          SUCCESS=0
+          TOTAL=0
+          
+          while [ $(($(date +%s) - START)) -lt 120 ]; do
+            TOTAL=$((TOTAL + 1))
+            if curl -f --max-time 5 http://bankcore-service.banking-prod/api/v1/health; then
+              SUCCESS=$((SUCCESS + 1))
+            fi
+            sleep 1
+          done
+          
+          echo "Success rate: $((SUCCESS * 100 / TOTAL))%"
+          [ $((SUCCESS * 100 / TOTAL)) -gt 95 ]
+
+  - name: stop-cpu-stress
+    templateType: Suspend
+    suspend:
+      duration: "10s"
+
+  # Test 4: DNS Chaos
+  - name: dns-chaos-test
+    templateType: DNSChaos
+    deadline: 5m
+    dnsChaos:
+      selector:
+        namespaces:
+        - banking-prod
+        labelSelectors:
+          app: bankcore
+      mode: all
+      action: random
+      duration: "1m"
+      patterns:
+      - postgres-service.banking-prod.svc.cluster.local
+      - "*.banking-prod.svc.cluster.local"
+
+---
+# Chaos Experiment for Zone Failure Simulation
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: zone-failure-simulation
+  namespace: banking-prod
+spec:
+  selector:
+    namespaces:
+    - banking-prod
+    labelSelectors:
+      app: bankcore
+    nodeSelectors:
+      topology.kubernetes.io/zone: us-east-1a
+  mode: all
+  action: pod-failure
+  duration: "5m"
+
+---
+# Chaos Experiment for Database Connection Issues
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: database-network-partition
+  namespace: banking-prod
+spec:
+  selector:
+    namespaces:
+    - banking-prod
+    labelSelectors:
+      app: bankcore
+  mode: all
+  action: partition
+  direction: to
+  target:
+    selector:
+      namespaces:
+      - banking-prod
+      labelSelectors:
+        app: postgresql
+    mode: all
+  duration: "2m"
+
+---
+# Schedule recurring chaos tests
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: banking-chaos-schedule
+  namespace: banking-prod
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  concurrencyPolicy: Forbid
+  historyLimit: 5
+  type: Workflow
+  workflow:
+    entry: entry
+    templates:
+    - name: entry
+      templateType: Serial
+      deadline: 1h
+      children:
+      - random-pod-kill
+      - network-latency
+      - cpu-memory-stress
+
+    - name: random-pod-kill
+      templateType: PodChaos
+      podChaos:
+        selector:
+          namespaces:
+          - banking-prod
+          labelSelectors:
+            app: bankcore
+        mode: one-indexed
+        value: "0"
+        action: pod-kill
+        gracePeriod: 0
+
+    - name: network-latency
+      templateType: NetworkChaos
+      deadline: 10m
+      networkChaos:
+        selector:
+          namespaces:
+          - banking-prod
+          labelSelectors:
+            app: bankcore
+        mode: fixed-percent
+        value: "50"
+        action: delay
+        delay:
+          latency: "100ms"
+          jitter: "50ms"
+        duration: "5m"
+
+    - name: cpu-memory-stress
+      templateType: StressChaos
+      deadline: 10m
+      stressChaos:
+        selector:
+          namespaces:
+          - banking-prod
+          labelSelectors:
+            app: bankcore
+        mode: fixed-percent
+        value: "33"
+        stressors:
+          cpu:
+            workers: 1
+            load: 50
+          memory:
+            workers: 1
+            size: "256Mi"
+        duration: "5m"
+
+---
+# Monitoring for chaos experiments
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chaos-monitoring
+  namespace: banking-prod
+data:
+  alerts.yaml: |
+    groups:
+    - name: chaos-experiments
+      interval: 30s
+      rules:
+      - alert: ChaosExperimentRunning
+        expr: chaos_mesh_experiment_info{namespace="banking-prod"} == 1
+        for: 1m
+        labels:
+          severity: info
+          team: platform
+        annotations:
+          summary: "Chaos experiment {{ $labels.experiment }} is running"
+          description: "A chaos experiment is currently active in the banking-prod namespace"
+      
+      - alert: ServiceDegradedDuringChaos
+        expr: |
+          (rate(http_server_requests_seconds_count{status=~"5..",namespace="banking-prod"}[2m]) > 0.1)
+          and
+          (chaos_mesh_experiment_info{namespace="banking-prod"} == 1)
+        for: 2m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Service degraded during chaos experiment"
+          description: "Error rate increased to {{ $value }} during chaos testing"
+      
+      - alert: ChaosExperimentFailed
+        expr: chaos_mesh_experiment_phase{phase="Failed"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Chaos experiment {{ $labels.experiment }} failed"
+          description: "The chaos experiment failed to complete successfully"
